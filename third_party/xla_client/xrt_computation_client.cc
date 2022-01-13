@@ -355,6 +355,8 @@ XrtComputationClient::TransferToServerInternal(
   tensorflow::profiler::TraceMe activity(
       "TransferToServerInternal", tensorflow::profiler::TraceMeLevel::kInfo);
 
+  static bool transfer_async =
+      xla::sys_util::GetEnvBool("XLA_TRANSFER_ASYNC", false);
   std::mutex lock;
   XrtSessionCache::SessionMap session_map;
   int64_t total_size = 0;
@@ -414,25 +416,85 @@ XrtComputationClient::TransferToServerInternal(
     for (auto& session_session_work : session_work_map) {
       XrtSession* session = session_session_work.first;
       SessionWork* session_work = &session_session_work.second;
-      auto runner = [&, session, session_work]() {
-        std::vector<tensorflow::Tensor> outputs;
-        XLA_CHECK_OK(session->session()->Run(session_work->feed_inputs,
-                                             session_work->outputs_handles,
-                                             &outputs));
-        XLA_CHECK_EQ(outputs.size(), session_work->outputs_handles.size());
 
-        for (size_t i = 0; i < outputs.size(); ++i) {
-          size_t li = session_work->index_mapping[i];
-          results[li] = std::make_shared<XrtData>(this, tensors[li].device,
-                                                  tensors[li].shape,
-                                                  outputs[i].scalar<int64_t>()());
+      if (!transfer_async) {
+        auto runner = [&, session, session_work]() {
+          std::vector<tensorflow::Tensor> outputs;
+          XLA_CHECK_OK(session->session()->Run(session_work->feed_inputs,
+                                               session_work->outputs_handles,
+                                               &outputs));
+          XLA_CHECK_EQ(outputs.size(), session_work->outputs_handles.size());
+
+          for (size_t i = 0; i < outputs.size(); ++i) {
+            size_t li = session_work->index_mapping[i];
+            results[li] = std::make_shared<XrtData>(
+                this, tensors[li].device, tensors[li].shape,
+                outputs[i].scalar<int64_t>()());
+          }
+          CreateDataHandlesCounter()->AddValue(outputs.size());
+        };
+        env::ScheduleIoClosure(
+            util::MultiWait::Completer(mwait, std::move(runner)));
+        mwait->Wait();
+      } else {
+        std::shared_ptr<AsyncHandle> async = std::make_shared<AsyncHandle>();
+        async->session = session;
+        // session_work points to a local object, we need to move the local
+        // object to the async object to prevent it from going out of scope.
+        async->session_work = std::move(*session_work);
+        async->unlockers.reserve(async->session_work.outputs_handles.size());
+        async->handles.reserve(async->session_work.outputs_handles.size());
+        for (size_t i = 0; i < async->session_work.outputs_handles.size();
+             ++i) {
+          size_t li = async->session_work.index_mapping[i];
+          // Create a XrtHandle with dummy handle, releasr needs to take the
+          // real handle upon destructon.
+          XrtHandlePtr handle_ptr = std::make_shared<XrtHandle>(
+              DataHandleLocker::dummy_handle,
+              [this, device = tensors[li].device](int64_t handle) {
+                this->ReleaseXrtData(device, handle);
+              },
+              /*async=*/true);
+          async->handles.emplace_back(handle_ptr);
+          async->unlockers.emplace_back(handle_ptr->LockHandle());
+          results[li] = std::make_shared<XrtData>(
+              this, tensors[li].device, tensors[li].shape, handle_ptr);
         }
-        CreateDataHandlesCounter()->AddValue(outputs.size());
-      };
-      env::ScheduleIoClosure(
-          util::MultiWait::Completer(mwait, std::move(runner)));
+        CreateDataHandlesCounter()->AddValue(
+            async->session_work.outputs_handles.size());
+        auto runner = [async]() {
+          try {
+            std::vector<tensorflow::Tensor> outputs;
+            XLA_CHECK_OK(async->session->session()->Run(
+                async->session_work.feed_inputs,
+                async->session_work.outputs_handles, &outputs));
+            XLA_CHECK_EQ(outputs.size(),
+                         async->session_work.outputs_handles.size());
+            for (size_t i = 0; i < outputs.size(); ++i) {
+              async->handles[i]->update_handle(outputs[i].scalar<int64_t>()());
+            }
+          } catch (...) {
+            // There are two paths of discovery of an exception happening on an
+            // asynchronous task. One happens if the creator of the asynchronous
+            // task explicitly waits for completion, in which case the exception
+            // will be thrown from the Wait() API. Re-throwing the exception
+            // below makes sure this will be captured by the completer function
+            // created below, and surfaced by the Wait() API. But we also need
+            // to surface the exception even in case the caller does not wait,
+            // and that is accomplished by setting the unlockers status. In that
+            // case the exception will be surfaced when the user tries to
+            // acquire the device locks the next time.
+            std::exception_ptr exptr = std::current_exception();
+            for (auto& unlocker : async->unlockers) {
+              unlocker.SetStatus(exptr);
+            }
+            throw;
+          }
+        };
+        env::ScheduleIoClosure(
+            util::MultiWait::Completer(mwait, std::move(runner)));
+      }
     }
-    mwait->Wait();
   }
   return results;
 }
@@ -1337,9 +1399,9 @@ void XrtComputationClient::InitializeDevices(
     // mesh coordinates are usually [x, y, z, c] ('x', 'y' and 'z' being the
     // spatial chip coordinated and 'c' the core number).
     int64_t base_index = parsed_device.task *
-                           topology_proto->num_tpu_devices_per_task() *
-                           topology_proto->mesh_shape_size() +
-                       parsed_device.id * topology_proto->mesh_shape_size();
+                             topology_proto->num_tpu_devices_per_task() *
+                             topology_proto->mesh_shape_size() +
+                         parsed_device.id * topology_proto->mesh_shape_size();
     std::vector<int> device_mesh_coords(topology_proto->mesh_shape_size());
     for (int i = 0; i < topology_proto->mesh_shape_size(); ++i) {
       device_mesh_coords[i] =
@@ -1442,8 +1504,8 @@ XrtComputationClient::GetComputationResults(
           handles_vec(i)));
     }
   } else {
-    results.push_back(std::make_shared<XrtData>(this, device, result_shape,
-                                                xrt_result.scalar<int64_t>()()));
+    results.push_back(std::make_shared<XrtData>(
+        this, device, result_shape, xrt_result.scalar<int64_t>()()));
   }
   CreateDataHandlesCounter()->AddValue(results.size());
   return results;
