@@ -293,7 +293,6 @@ class ComputationClient {
   static metrics::Metric* ExecuteParallelMetric();
   static metrics::Metric* ExecuteChainedMetric();
   static metrics::Metric* DeconstructTupleMetric();
-  static metrics::Metric* DataHandleBarrierMetric();
   static metrics::Counter* CreateDataHandlesCounter();
   static metrics::Counter* ReleaseDataHandlesCounter();
   static metrics::Counter* DestroyDataHandlesCounter();

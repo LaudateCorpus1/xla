@@ -149,14 +149,6 @@ class XrtComputationClient : public ComputationClient {
   struct XrtData : public Data {
     XrtData(std::string device, Shape device_shape)
         : Data(std::move(device), std::move(device_shape)) {}
-    // XrtData(XrtComputationClient* self, std::string device, Shape
-    // device_shape,
-    //         int64_t handle)
-    //     : Data(std::move(device), std::move(device_shape)),
-    //       handle_ptr(std::make_shared<XrtHandle>(
-    //           handle, [self, device = this->device(), handle]() {
-    //             self->ReleaseXrtData(device, handle);
-    //           })) {}
 
     XrtData(XrtComputationClient* self, std::string device, Shape device_shape,
             int64_t handle)
