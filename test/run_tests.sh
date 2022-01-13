@@ -51,6 +51,11 @@ function run_downcast_bf16 {
   XLA_DOWNCAST_BF16=1 run_test "$@"
 }
 
+function run_async_upload {
+  echo "Running with XLA_USE_BF16: $@"
+  XLA_TRANSFER_ASYNC=1 run_test "$@"
+}
+
 function run_dynamic {
   if [[ "$TPUVM_MODE" == "1" ]]; then
     run_test "$@"
@@ -71,6 +76,7 @@ function run_all_tests {
   run_dynamic python3 "$CDIR/../../test/test_type_promotion.py" "$@" -v TestTypePromotionXLA
   run_dynamic python3 "$CDIR/test_operations.py" "$@" --verbosity=$VERBOSITY
   run_opbyop python3 "$CDIR/test_operations.py" "$@" --verbosity=$VERBOSITY
+  run_async_upload python3 "$CDIR/test_operations.py" "$@" --verbosity=$VERBOSITY
   run_test python3 "$CDIR/test_mp_replication.py"
   run_test python3 "$CDIR/test_mp_all_to_all.py"
   run_test python3 "$CDIR/test_mp_collective_permute.py"
