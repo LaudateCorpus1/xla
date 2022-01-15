@@ -34,16 +34,8 @@
 
 namespace xla {
 
-class DataHandleLocker {
- protected:
-  static metrics::Metric* DataHandleBarrierMetric() {
-    static metrics::Metric* metric =
-        new metrics::Metric("DataHandleBarrierTime", metrics::MetricFnTime);
-    return metric;
-  };
-
+class XrtLocker {
  public:
-  static const int64_t dummy_handle = -151235;
   void Lock() {
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [this] { return !locked_; });
@@ -59,7 +51,6 @@ class DataHandleLocker {
   }
 
   void Barrier() {
-    metrics::TimedSection timed(DataHandleBarrierMetric());
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [this] { return !locked_; });
     cv_.notify_all();
@@ -79,6 +70,56 @@ class DataHandleLocker {
   std::condition_variable cv_;
   bool locked_ = false;
   std::exception_ptr exptr_;
+};
+
+class DataHandleLocker : public XrtLocker {
+ protected:
+  static metrics::Metric* DataHandleBarrierMetric() {
+    static metrics::Metric* metric =
+        new metrics::Metric("DataHandleBarrierTime", metrics::MetricFnTime);
+    return metric;
+  };
+
+ public:
+  static const int64_t dummy_handle = -151235;
+  // TODO: make barrier incremented metric
+};
+
+class XrtDeviceLocker : public XrtLocker {
+ protected:
+  static metrics::Metric* DeviceBarrierMetric() {
+    static metrics::Metric* metric = new metrics::Metric(
+        "XrtDeviceHandleBarrierTime", metrics::MetricFnTime);
+    return metric;
+  };
+
+ public:
+  explicit XrtDeviceLocker(std::string device) : device_(std::move(device)) {}
+
+ private:
+  std::string device_;
+};
+
+class XrtDeviceLockerArena {
+ public:
+  static XrtDeviceLockerArena* Get() {
+    static XrtDeviceLockerArena* arena = new XrtDeviceLockerArena();
+    return arena;
+  }
+
+  std::shared_ptr<XrtDeviceLocker> GetLocker(const std::string& device) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = lockers_.find(device);
+    if (it == lockers_.end()) {
+      it = lockers_.emplace(device, std::make_shared<XrtDeviceLocker>(device))
+               .first;
+    }
+    return it->second;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::map<std::string, std::shared_ptr<XrtDeviceLocker>> lockers_;
 };
 
 class XrtComputationClient : public ComputationClient {
@@ -341,6 +382,8 @@ class XrtComputationClient : public ComputationClient {
   struct AsyncHandle {
     XrtSession* session;
     SessionWork session_work;
+    std::string xrt_device;
+    std::shared_ptr<xla::util::ExceptionCleanup> unlocker;
     std::vector<xla::util::ExceptionCleanup> unlockers;
     std::vector<XrtHandlePtr> handles;
   };

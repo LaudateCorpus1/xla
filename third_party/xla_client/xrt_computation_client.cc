@@ -33,6 +33,16 @@ namespace {
 
 static const char* const kLocalService = "localservice";
 
+xla::util::ExceptionCleanup LockXrtDevice(const std::string& device) {
+  auto locker = XrtDeviceLockerArena::Get()->GetLocker(device);
+  locker->Lock();
+  return xla::util::ExceptionCleanup(
+      [locker =
+           std::move(locker)](xla::util::ExceptionCleanup::StatusType status) {
+        locker->Unlock(std::move(status));
+      });
+}
+
 // A simple Tensorflow Allocator which caches Tensor allocations in order to
 // avoid paying the kernel's clear_page_c() price.
 class TensorAllocator : public tensorflow::Allocator {
@@ -362,6 +372,22 @@ XrtComputationClient::TransferToServerInternal(
   int64_t total_size = 0;
   auto mwait = std::make_shared<util::MultiWait>(tensors.size());
   std::map<XrtSession*, SessionWork> session_work_map;
+  std::map<XrtSession*, std::string> session_device_map;
+  std::map<std::string, std::shared_ptr<xla::util::ExceptionCleanup>>
+      device_unlocker_map;
+
+  if (transfer_async) {
+    // acquire allocation lock for all devices we want to allocate on
+    xla::util::Unique<std::string> unique_devices;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+      unique_devices.set(TorchDeviceToXrtDevice(tensors[i].device));
+    }
+    // now assume that there is one device per call
+    device_unlocker_map[*unique_devices] =
+        std::make_shared<xla::util::ExceptionCleanup>(
+            LockXrtDevice(*unique_devices));
+  }
+
   {
     tensorflow::profiler::TraceMe activity(
         "TransferToServerTransform", tensorflow::profiler::TraceMeLevel::kInfo);
@@ -383,6 +409,7 @@ XrtComputationClient::TransferToServerInternal(
           std::lock_guard<std::mutex> slock(lock);
           XrtSession* session = GetSessionForXrtDevice(
               alloc_session_cache_.get(), xrt_device, &session_map);
+          session_device_map[session] = xrt_device;
           SessionWork* session_work = &session_work_map[session];
           tensorflow::Scope device_scope =
               session->root()->WithDevice(xrt_device);
@@ -442,6 +469,8 @@ XrtComputationClient::TransferToServerInternal(
         // session_work points to a local object, we need to move the local
         // object to the async object to prevent it from going out of scope.
         async->session_work = std::move(*session_work);
+        async->xrt_device = session_device_map[session];
+        async->unlocker = device_unlocker_map[async->xrt_device];
         async->unlockers.reserve(async->session_work.outputs_handles.size());
         async->handles.reserve(async->session_work.outputs_handles.size());
         for (size_t i = 0; i < async->session_work.outputs_handles.size();
